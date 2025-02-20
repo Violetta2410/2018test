@@ -23,15 +23,14 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
     "openid",
     "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/calendar.events.readonly",
-    "https://www.googleapis.com/auth/contacts.readonly",
-    "https://www.googleapis.com/auth/tasks.readonly",
-    # 새로 추가된 API 범위들
-    "https://www.googleapis.com/auth/contacts.readonly",
-    "https://www.googleapis.com/auth/tasks.readonly",
+    "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/contacts",
+    "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/tasks.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
 ]
 
 # 포트 설정 (Google Cloud Console에 등록된 포트와 일치)
@@ -45,8 +44,8 @@ flow = Flow.from_client_secrets_file(
     redirect_uri=f"http://localhost:{PORT}/oauth2callback",
 )
 
-# 안전하지 않은 로컬 연결 허용
-os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+# 스코프 검증 비활성화 추가
+flow.oauth2session.verify_scope = False
 
 
 class OAuthHandler(BaseHTTPRequestHandler):
@@ -104,6 +103,84 @@ class OAuthHandler(BaseHTTPRequestHandler):
             self.wfile.write("처리 중 오류가 발생했습니다.".encode("utf-8"))
 
 
+def get_all_sheets_data(creds):
+    """
+    사용자의 모든 Google Sheets 데이터를 가져옵니다.
+    """
+    try:
+        # Sheets API 서비스 생성
+        sheets_service = build("sheets", "v4", credentials=creds)
+
+        # Drive API를 사용하여 사용자의 모든 스프레드시트 파일 목록 가져오기
+        drive_service = build("drive", "v3", credentials=creds)
+        files = (
+            drive_service.files()
+            .list(
+                q="mimeType='application/vnd.google-apps.spreadsheet'",
+                spaces="drive",
+                fields="files(id, name)",
+                pageSize=1000,
+            )
+            .execute()
+        )
+
+        all_sheets_data = []
+
+        for file in files.get("files", []):
+            try:
+                # 각 스프레드시트의 모든 시트 정보 가져오기
+                spreadsheet = (
+                    sheets_service.spreadsheets()
+                    .get(spreadsheetId=file["id"])
+                    .execute()
+                )
+
+                for sheet in spreadsheet.get("sheets", []):
+                    sheet_name = sheet["properties"]["title"]
+                    range_name = f"{sheet_name}!A1:Z1000"  # 적절한 범위 설정
+
+                    # 시트 데이터 가져오기
+                    result = (
+                        sheets_service.spreadsheets()
+                        .values()
+                        .get(spreadsheetId=file["id"], range=range_name)
+                        .execute()
+                    )
+
+                    values = result.get("values", [])
+
+                    if values:
+                        sheet_data = {
+                            "spreadsheet_name": file["name"],
+                            "spreadsheet_id": file["id"],
+                            "sheet_name": sheet_name,
+                            "data": values,
+                        }
+                        all_sheets_data.append(sheet_data)
+
+                        logger.info(
+                            f"Retrieved data from sheet '{sheet_name}' in '{file['name']}'"
+                        )
+
+            except Exception as sheet_error:
+                logger.error(
+                    f"Error processing spreadsheet {file['name']}: {sheet_error}"
+                )
+                continue
+
+        # 시트 데이터 JSON으로 저장
+        if all_sheets_data:
+            with open("sheets_data.json", "w", encoding="utf-8") as f:
+                json.dump(all_sheets_data, f, ensure_ascii=False, indent=4)
+                logger.info("Saved sheets data to sheets_data.json")
+
+        return all_sheets_data
+
+    except Exception as e:
+        logger.error(f"Error fetching sheets data: {e}")
+        return None
+
+
 def get_credentials():
     creds = None
 
@@ -128,42 +205,46 @@ def get_credentials():
                 return None
         else:
             try:
-                # 리디렉션 URI를 정확히 지정
                 flow = Flow.from_client_secrets_file(
                     "credentials.json",
                     scopes=SCOPES,
                     redirect_uri=f"http://localhost:{PORT}/oauth2callback",
                 )
 
+                # OAuth 세션 설정
+                flow.oauth2session._client.verify_scopes = False
+                flow.oauth2session.scope = sorted(SCOPES)  # 스코프 정렬
+
                 auth_url, _ = flow.authorization_url(
                     access_type="offline",
                     include_granted_scopes="true",
-                    prompt="consent",  # 새로운 토큰 요청
+                    prompt="consent",
                 )
 
-                # 서버 시작
                 server = HTTPServer(("localhost", PORT), OAuthHandler)
                 server.oauth_code = None
                 logger.info(f"Started OAuth callback server on port {PORT}")
 
-                # 브라우저에서 인증 URL 열기
-                logger.info(f"Opening auth URL: {auth_url}")
                 webbrowser.open(auth_url)
 
-                # 코드를 받을 때까지 서버 실행
                 while server.oauth_code is None:
                     server.handle_request()
 
-                # 서버 종료
                 server.server_close()
                 logger.info("OAuth callback server stopped")
 
-                # 토큰 얻기
-                flow.fetch_token(code=server.oauth_code)
-                creds = flow.credentials
-                logger.info("Successfully obtained new credentials")
+                try:
+                    flow.fetch_token(code=server.oauth_code)
+                    creds = flow.credentials
+                    logger.info("Successfully obtained new credentials")
+                except Warning as w:
+                    # 스코프 변경 경고를 무시하고 계속 진행
+                    logger.warning(f"Scope warning (ignored): {str(w)}")
+                    creds = flow.credentials
+                except Exception as e:
+                    logger.error(f"Error fetching token: {str(e)}")
+                    raise
 
-                # 토큰 저장
                 with open("token.pickle", "wb") as token:
                     pickle.dump(creds, token)
                 logger.info("Saved credentials to token.pickle")
@@ -208,11 +289,17 @@ def get_all_calendar_events(creds):
             calendar_id = calendar_list_entry["id"]
 
             try:
-                # 날짜 제한 제거
+                # 시작 시간 기준으로 최근 1년치와 향후 1년치 이벤트 가져오기
+                now = datetime.datetime.utcnow()
+                one_year_ago = (now - datetime.timedelta(days=365)).isoformat() + "Z"
+                one_year_later = (now + datetime.timedelta(days=365)).isoformat() + "Z"
+
                 events_result = (
                     service.events()
                     .list(
                         calendarId=calendar_id,
+                        timeMin=one_year_ago,  # 1년 전부터
+                        timeMax=one_year_later,  # 1년 후까지
                         maxResults=1000,  # 캘린더당 최대 1000개 이벤트
                         singleEvents=True,
                         orderBy="startTime",
@@ -222,10 +309,21 @@ def get_all_calendar_events(creds):
 
                 events = events_result.get("items", [])
 
+                # 각 이벤트에 캘린더 이름 추가
                 for event in events:
                     event["calendar_name"] = calendar_list_entry.get(
-                        "summary", "unnamed calendar"
+                        "summary", "Unnamed Calendar"
                     )
+
+                    # 이벤트 시작, 종료 시간 필드 안전하게 처리
+                    if "start" in event and "dateTime" not in event["start"]:
+                        event["start"]["dateTime"] = (
+                            event["start"].get("date") + "T00:00:00"
+                        )
+                    if "end" in event and "dateTime" not in event["end"]:
+                        event["end"]["dateTime"] = (
+                            event["end"].get("date") + "T23:59:59"
+                        )
 
                 all_events.extend(events)
 
@@ -241,23 +339,16 @@ def get_all_calendar_events(creds):
             )
         )
 
-        # 이벤트 정보 로깅
+        # 캘린더 이벤트 JSON으로 저장
         if all_events:
-            logger.info(f"Total events found: {len(all_events)}")
-            for event in all_events:
-                start = event["start"].get(
-                    "dateTime", event["start"].get("date", "날짜 없음")
-                )
-                summary = event.get("summary", "No title")
-                calendar_name = event.get("calendar_name", "Unknown calendar")
-                logger.info(f"{summary} - {start} (from {calendar_name})")
-        else:
-            logger.info("No events found across all calendars.")
+            with open("calendar_events.json", "w", encoding="utf-8") as f:
+                json.dump(all_events, f, ensure_ascii=False, indent=4)
+            logger.info(f"총 {len(all_events)}개의 캘린더 이벤트 저장 완료")
 
         return all_events
 
     except Exception as e:
-        logger.error(f"An error occurred while fetching all calendar events: {e}")
+        logger.error(f"모든 캘린더 이벤트를 가져오는 중 오류 발생: {e}")
         return None
 
 
@@ -484,6 +575,16 @@ def main():
             with open("contacts.json", "w", encoding="utf-8") as f:
                 json.dump(all_contacts, f, ensure_ascii=False, indent=4)
                 print("연락처를 contacts.json에 저장했습니다.")
+
+        # 모든 시트 데이터 가져오기
+        sheets_data = get_all_sheets_data(creds)
+        if sheets_data:
+            print(f"\n총 {len(sheets_data)}개의 시트 데이터를 가져왔습니다:")
+            for sheet in sheets_data:
+                print(f"스프레드시트: {sheet['spreadsheet_name']}")
+                print(f"시트: {sheet['sheet_name']}")
+                print(f"데이터 행 수: {len(sheet['data'])}")
+                print("---")
 
     except Exception as e:
         logger.error(f"프로그램 오류: {str(e)}", exc_info=True)
